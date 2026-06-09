@@ -1,10 +1,28 @@
 import { createClient } from "@supabase/supabase-js";
 
-const supabaseUrl = process.env.SUPABASE_URL || "";
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const supabaseUrl = (process.env.SUPABASE_URL || "").trim();
+const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+
+const isValidUrl = /^https?:\/\/.+/.test(supabaseUrl);
+
+if (supabaseUrl && !isValidUrl) {
+  console.warn(
+    `[supabase] SUPABASE_URL is set but invalid: "${supabaseUrl}". ` +
+      `Caching disabled. URL must start with https://`,
+  );
+}
 
 export const supabase =
-  supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
+  isValidUrl && supabaseKey
+    ? (() => {
+        try {
+          return createClient(supabaseUrl, supabaseKey);
+        } catch (e) {
+          console.error("[supabase] failed to init:", e instanceof Error ? e.message : e);
+          return null;
+        }
+      })()
+    : null;
 
 // Cache TTL: 15 minutes — prices change slowly enough that this is safe.
 export const CACHE_TTL_MS = 15 * 60 * 1000;
