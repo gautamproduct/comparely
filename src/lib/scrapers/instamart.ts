@@ -10,6 +10,24 @@ export async function scrapeInstamart(
     async (context) => {
       const page = await context.newPage();
 
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      });
+
+      const apiPayloads: Array<{ url: string; sample: string }> = [];
+      page.on("response", async (response) => {
+        try {
+          const url = response.url();
+          const ct = response.headers()["content-type"] || "";
+          if (!ct.includes("application/json")) return;
+          if (!/search|listing|product|widget/i.test(url)) return;
+          const text = await response.text();
+          if (text.includes("₹") || /price|mrp|store_price/i.test(text)) {
+            apiPayloads.push({ url, sample: text.slice(0, 500) });
+          }
+        } catch {}
+      });
+
       await page.addInitScript(({ lat, lon }) => {
         try {
           localStorage.setItem("userLocation", JSON.stringify({ lat, lng: lon }));
@@ -18,13 +36,17 @@ export async function scrapeInstamart(
 
       await page.goto("https://www.swiggy.com/instamart", {
         waitUntil: "domcontentloaded",
-        timeout: 20000,
+        timeout: 25000,
       });
-      await page.waitForTimeout(2500);
+      await page.waitForTimeout(3000);
 
       const searchUrl = `https://www.swiggy.com/instamart/search?custom_back=true&query=${encodeURIComponent(query)}`;
-      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
-      await page.waitForTimeout(3500);
+      await page.goto(searchUrl, { waitUntil: "networkidle", timeout: 25000 });
+      await page.waitForTimeout(2500);
+
+      const pageTitle = await page.title();
+      const pageUrl = page.url();
+      console.log(`[instamart] page="${pageTitle}" url="${pageUrl}"`);
 
       const notServiceable = await page
         .locator("text=/not serviceable|coming soon|not available/i")
@@ -46,49 +68,63 @@ export async function scrapeInstamart(
           available: boolean;
         }> = [];
 
-        const cards = document.querySelectorAll(
-          '[data-testid*="ItemWidgetContainer"], [data-testid*="product"], [class*="ProductCard"], [class*="ItemCard"]',
-        );
+        const cardSelectors = [
+          '[data-testid*="ItemWidget"]',
+          '[data-testid*="product"]',
+          '[class*="ProductCard"]',
+          '[class*="ItemCard"]',
+          '[class*="_product"]',
+          '[class*="item-card"]',
+        ];
+        const cards = new Set<Element>();
+        cardSelectors.forEach((sel) => document.querySelectorAll(sel).forEach((el) => cards.add(el)));
 
         cards.forEach((card, i) => {
-          const nameEl =
-            card.querySelector('[data-testid*="ItemWidgetItemName"]') ||
-            card.querySelector("h3") ||
-            card.querySelector("h4") ||
-            card.querySelector('[class*="ItemName"]');
-          const name = nameEl?.textContent?.trim() || "";
-
           const text = card.textContent || "";
-          const allPrices = [...text.matchAll(/₹\s*(\d+(?:\.\d+)?)/g)].map((m) =>
+          const priceMatches = [...text.matchAll(/₹\s*(\d+(?:\.\d+)?)/g)].map((m) =>
             parseFloat(m[1]),
           );
+          if (priceMatches.length === 0) return;
 
-          const quantityEl =
-            card.querySelector('[data-testid*="ItemWidgetItemDescription"]') ||
-            card.querySelector('[class*="Quantity"]') ||
-            card.querySelector('[class*="weight"]');
-          const quantity = quantityEl?.textContent?.trim() || "";
-
+          const name =
+            card.querySelector('[data-testid*="ItemName"], h3, h4, [class*="ItemName"], [class*="Name"]')
+              ?.textContent?.trim() || "";
+          const quantity =
+            card.querySelector('[data-testid*="ItemWidgetItemDescription"], [class*="Quantity"], [class*="weight"]')
+              ?.textContent?.trim() || "";
           const img = card.querySelector("img");
           const imageUrl = img?.getAttribute("src") || "";
           const id = `instamart-${i}-${name.slice(0, 20)}`;
-          const available = !text.toLowerCase().includes("notify");
 
-          if (name && allPrices.length > 0) {
+          if (name) {
             items.push({
               id,
               name,
-              price: Math.min(...allPrices),
-              mrp: Math.max(...allPrices),
+              price: Math.min(...priceMatches),
+              mrp: Math.max(...priceMatches),
               quantity,
               imageUrl,
-              available,
+              available: !text.toLowerCase().includes("notify"),
             });
           }
         });
 
         return items;
       });
+
+      if (products.length === 0) {
+        const bodySnippet = await page.evaluate(() => document.body.innerText.slice(0, 500));
+        console.log(`[instamart] 0 products. Body snippet:\n${bodySnippet}`);
+        if (apiPayloads.length > 0) {
+          console.log(`[instamart] captured ${apiPayloads.length} JSON API payloads:`);
+          for (const p of apiPayloads.slice(0, 3)) {
+            console.log(`  URL: ${p.url}`);
+            console.log(`  Sample: ${p.sample.replace(/\s+/g, " ").slice(0, 300)}`);
+          }
+        }
+      } else {
+        console.log(`[instamart] extracted ${products.length} products`);
+      }
 
       const normalized: RawProduct[] = products.slice(0, 20).map((p) => ({
         platform: "instamart" as const,

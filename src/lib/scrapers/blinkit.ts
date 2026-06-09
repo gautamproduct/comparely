@@ -10,15 +10,39 @@ export async function scrapeBlinkit(
     async (context) => {
       const page = await context.newPage();
 
+      // Stealth: hide webdriver flag
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      });
+
+      // Intercept JSON responses that might contain product data
+      const apiPayloads: Array<{ url: string; sample: string }> = [];
+      page.on("response", async (response) => {
+        try {
+          const url = response.url();
+          const ct = response.headers()["content-type"] || "";
+          if (!ct.includes("application/json")) return;
+          if (!/search|product|listing|catalog|layout/i.test(url)) return;
+          const text = await response.text();
+          if (text.includes("₹") || /price|mrp/i.test(text)) {
+            apiPayloads.push({ url, sample: text.slice(0, 500) });
+          }
+        } catch {}
+      });
+
       await page.goto("https://blinkit.com/", {
         waitUntil: "domcontentloaded",
-        timeout: 20000,
+        timeout: 25000,
       });
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(2000);
 
       const searchUrl = `https://blinkit.com/s/?q=${encodeURIComponent(query)}`;
-      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
-      await page.waitForTimeout(3000);
+      await page.goto(searchUrl, { waitUntil: "networkidle", timeout: 25000 });
+      await page.waitForTimeout(2000);
+
+      const pageTitle = await page.title();
+      const pageUrl = page.url();
+      console.log(`[blinkit] page="${pageTitle}" url="${pageUrl}"`);
 
       const notServiceable = await page
         .locator("text=/not deliverable|not serviceable|coming soon/i")
@@ -26,6 +50,7 @@ export async function scrapeBlinkit(
         .isVisible()
         .catch(() => false);
       if (notServiceable) {
+        console.log(`[blinkit] not serviceable for lat=${lat} lon=${lon}`);
         return { products: [], status: "not_serviceable" as const };
       }
 
@@ -40,45 +65,69 @@ export async function scrapeBlinkit(
           available: boolean;
         }> = [];
 
-        const cards = document.querySelectorAll(
-          '[data-test-id*="plp-product"], [class*="ProductCard"], [class*="plp-product"], [role="button"][class*="product"]',
-        );
+        // Very broad — try many selectors
+        const cardSelectors = [
+          '[data-test-id*="product"]',
+          '[data-pf-id*="product"]',
+          '[class*="ProductCard"]',
+          '[class*="product-card"]',
+          '[class*="plp-product"]',
+          '[class*="ProductListing"]',
+          'a[href*="/prn/"]',
+          'a[href*="/cn/"]',
+        ];
+        const cards = new Set<Element>();
+        cardSelectors.forEach((sel) => {
+          document.querySelectorAll(sel).forEach((el) => cards.add(el));
+        });
 
         cards.forEach((card, i) => {
+          const text = card.textContent || "";
+          const priceMatches = [...text.matchAll(/₹\s*(\d+(?:\.\d+)?)/g)].map((m) =>
+            parseFloat(m[1]),
+          );
+          if (priceMatches.length === 0) return;
+
           const name =
-            card.querySelector('[class*="Product__UpdatedTitle"], [class*="ProductName"], h4, h3')
+            card.querySelector('[class*="Title"], [class*="Name"], h3, h4, h5, p[class*="name"]')
               ?.textContent?.trim() || "";
-          const priceText =
-            card.querySelector('[class*="Product__UpdatedPriceAndAtc"], [class*="Price"]')
-              ?.textContent?.trim() || "";
-          const priceMatch = priceText.match(/₹\s*(\d+(?:\.\d+)?)/);
-          const mrpMatch = priceText.match(/₹\s*(\d+(?:\.\d+)?)\s*₹\s*(\d+(?:\.\d+)?)/);
           const quantity =
-            card.querySelector('[class*="Product__UpdatedQuantity"], [class*="Quantity"], [class*="Weight"]')
+            card.querySelector('[class*="Quantity"], [class*="Weight"], [class*="weight"], [class*="size"]')
               ?.textContent?.trim() || "";
           const img = card.querySelector("img");
           const imageUrl = img?.getAttribute("src") || "";
-          const id =
-            card.getAttribute("data-test-id") ||
-            card.getAttribute("id") ||
-            `blinkit-${i}-${name.slice(0, 20)}`;
-          const available = !card.textContent?.toLowerCase().includes("notify");
+          const id = `blinkit-${i}-${name.slice(0, 20) || Math.random()}`;
 
-          if (name && priceMatch) {
+          if (name && priceMatches.length > 0) {
             items.push({
               id,
               name,
-              price: parseFloat(priceMatch[1]),
-              mrp: mrpMatch ? parseFloat(mrpMatch[1]) : parseFloat(priceMatch[1]),
+              price: Math.min(...priceMatches),
+              mrp: Math.max(...priceMatches),
               quantity,
               imageUrl,
-              available,
+              available: !text.toLowerCase().includes("notify"),
             });
           }
         });
 
         return items;
       });
+
+      if (products.length === 0) {
+        // Diagnostic dump — only on failure
+        const bodySnippet = await page.evaluate(() => document.body.innerText.slice(0, 500));
+        console.log(`[blinkit] 0 products. Body snippet:\n${bodySnippet}`);
+        if (apiPayloads.length > 0) {
+          console.log(`[blinkit] captured ${apiPayloads.length} JSON API payloads:`);
+          for (const p of apiPayloads.slice(0, 3)) {
+            console.log(`  URL: ${p.url}`);
+            console.log(`  Sample: ${p.sample.replace(/\s+/g, " ").slice(0, 300)}`);
+          }
+        }
+      } else {
+        console.log(`[blinkit] extracted ${products.length} products`);
+      }
 
       const normalized: RawProduct[] = products.slice(0, 20).map((p) => ({
         platform: "blinkit" as const,
